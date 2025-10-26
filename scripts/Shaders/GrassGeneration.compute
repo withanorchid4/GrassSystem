@@ -1,0 +1,239 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+
+struct GrassBlade
+{
+    float3 position;
+    float rotAngle;
+    float hash;
+    float height;
+    float width;
+    float tilt;
+    float bend;
+    float3 surfaceNorm;
+    float windForce;
+    float sideBend;
+};
+
+struct ClumpParameter
+{
+    float pullToCentre; //控制草叶向clump中心聚拢的程度，越大草越集中在簇中心
+    float pointInSameDirection; //越大，草叶朝向越统一
+    float baseHeight;          // 草叶的基础高度
+    float heightRandom;        // 草叶高度的随机变化范围
+    float baseWidth;           // 草叶的基础宽度
+    float widthRandom;         // 草叶宽度的随机变化范围
+    float baseTilt;            // 草叶的基础倾斜度，控制顶端偏离垂直方向的程度
+    float tiltRandom;          // 草叶倾斜度的随机变化范围
+    float baseBend;            // 草叶的基础弯曲度，控制整体曲线形状
+    float bendRandom;          // 草叶弯曲度的随机变化范围
+};
+
+AppendStructuredBuffer<GrassBlade> _grassPosBuf;
+
+StructuredBuffer<ClumpParameter> _ClumpParameters;
+
+uint _Resolution;
+float _GrassSpacing;
+float _JitterStrength;
+
+// Terrain parameters
+Texture2D<float4> _HeightMap;
+Texture2D<float4> _DetailMap;
+SamplerState LinearClampSampler;
+
+//voronoi贴图和采样器
+Texture2D<float4> ClumpTex;
+SamplerState samplerClumpTex;
+
+
+float3 _TerrainPosition;
+float _HeightMapScale;
+float _HeightMapMultiplier;
+
+//剔除相关
+float3 _WSpaceCameraPos;
+float _DistanceCullStartDist;
+float _DistanceCullEndDist;
+float _DistanceCullMinimumGrassAmount; //最小草叶密度
+
+//视锥剔除
+float4x4 _VP_MATRIX;
+float _FrustumCullNearOffset;
+float _FrustumCullEdgeOffset;
+
+//草丛
+float _ClumpScale;
+float _NumClumpParameters;
+
+//风相关
+Texture2D<float4> _LocalWindTex; //噪声贴图
+SamplerState LinearRepeatSampler;  //采样器
+float _LocalWindScale;
+float _LocalWindSpeed;  //这两个用于uv变化
+float _LocalWindStrength;  //影响草的弯曲，并传递给vert shader来做进一步动画
+float _LocalWindRotateAmount;  //草在风的作用下的旋转量
+float _Time;  //用于实现动画！！！
+
+float2 HashFloat2(float2 p)
+{
+    float t = dot(p, float2(12.9898, 78.233));
+    float2 q = float2(t, t * 1.61803398875);
+    return frac(sin(q) * 43758.5453);
+}
+
+float Rand(float3 vec)  //根据float3 计算一个随机数
+{
+    return frac(sin(dot(vec.xyz, float3(12.9898, 78.233, 53.539))) * 43758.5453);
+}
+
+float Remap(float t)  //0~1映射到-1~1
+{
+    return (t * 2) - 1;
+}
+
+
+float SampleHeight(float2 normalizedPos) //通过一个uv坐标来从高度图中采样出一个高度
+{
+    float height = UnpackHeightmap(_HeightMap.SampleLevel(LinearClampSampler, normalizedPos, 0));
+    return height * _HeightMapMultiplier * 2;
+}
+
+float3 FitTerrainPosition(float3 position)  //根据一个位置得到一个地表位置，是上面函数的使用封装
+{
+    float2 normalizedPos = (position.xz - _TerrainPosition.xz) / _HeightMapScale;
+    return float3(position.x, _TerrainPosition.y + SampleHeight(normalizedPos), position.z);
+}
+
+
+float SampleGrass(float2 normalizedPos)  //通过uv位置获取草的图层值
+{
+    float value = _DetailMap.SampleLevel(LinearClampSampler, normalizedPos, 0).r;  //r通道代表图层
+    return value;  //通过这个返回值知道这里有没有草
+}
+
+//距离剔除函数：将距离smooth到远近可见区间当中，越近则被剔除的概率越小，越远越大，用随机数提供概率
+uint DistanceCull(float3 worldPos, float hash)
+{
+    float d = distance(worldPos, _WSpaceCameraPos);
+    float distanceSmoothStep = 1 - smoothstep(_DistanceCullStartDist, _DistanceCullEndDist, d);
+    distanceSmoothStep = (distanceSmoothStep * (1 - _DistanceCullMinimumGrassAmount)) + _DistanceCullMinimumGrassAmount;
+    return hash > 1 - distanceSmoothStep ? 1 : 0;
+}
+
+//视锥剔除函数：
+uint FrustumCull(float3 worldPos)//VP矩阵从外面传进来，注意怎么在裁剪空间裁剪的
+{
+    float4 clipPos = mul(_VP_MATRIX, float4(worldPos, 1));
+
+    //不管用不用reverse-z都是0~w之间，但是在开启reverse-z时，z=w代表是近平面
+    return (clipPos.z > clipPos.w
+        || clipPos.z < 0
+        || clipPos.x < -clipPos.w + _FrustumCullEdgeOffset
+        || clipPos.x > clipPos.w - _FrustumCullEdgeOffset
+        || clipPos.y < -clipPos.w + _FrustumCullNearOffset
+        || clipPos.y > clipPos.w)
+            ? 0 : 1;
+}
+
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    // TODO: insert actual code here!
+    if(id.x < _Resolution && id.y < _Resolution)
+    {
+        float3 position = float3(id.x, 0, id.y) * _GrassSpacing;
+        float2 hash = HashFloat2(id.xy);
+        float2 jitter = ((hash * 2) - 1) * _JitterStrength;
+        position.xz += jitter;
+
+        float2 clumpUV = position.xz * float2(_ClumpScale.xx); //得到采样voronoi贴图的坐标
+        float3 clumpData = ClumpTex.SampleLevel(samplerClumpTex, clumpUV, 0).xyz;
+        //这个数据是三个通道：r是草丛种类序号，对应一种配置，gb是草丛中心坐标
+        uint clumpParameterIndex = clumpData.x;
+        ClumpParameter bladeParameters = _ClumpParameters[int(clumpParameterIndex)];
+
+        //todo：下面三行没太看懂，感觉不太要紧，反正就是做了一些数学变换得到了草丛中心的坐标
+        float2 clumpCentre = (clumpData.yz + floor(clumpUV)) / float2(_ClumpScale.xx);
+        position.xz = lerp(position.xz, clumpCentre, bladeParameters.pullToCentre);  //用传入的参数向中心插值聚拢
+        position.xz += _TerrainPosition.xz;  //让草叶跟随地形
+
+        float2 normalizedPos = (position.xz - _TerrainPosition.xz) / _HeightMapScale;  //获取草相对于terrain中心的位置
+        if (SampleGrass(normalizedPos) < 0.5) return;  //采样图层看看这里有没有草
+
+        position.y = _TerrainPosition.y + SampleHeight(normalizedPos);
+
+        float3 posToCam = normalize(_WSpaceCameraPos - position); //此变量用于判断观察者在看草叶的正面还是侧面
+        //侧面的话后面会用一个hack让草叶更饱满
+
+        //求地表法线
+        float3 bitangent = float3(1,0,0);
+        float3 tangent = float3(0,0,1);
+
+        float3 vertexBitangent = FitTerrainPosition(position + bitangent * 0.01);
+        float3 vertexTangent = FitTerrainPosition(position + tangent * 0.01);
+        float3 newBitangent = (vertexBitangent - position).xyz;
+        float3 newTangent = (vertexTangent - position).xyz;
+        float3 norm = normalize(cross(newTangent, newBitangent));//地表法线
+
+
+
+        uint distanceCull = DistanceCull(position, hash.x);
+
+        uint frustumCull = FrustumCull(position);
+
+        if (1 || distanceCull == 1 && frustumCull == 1)
+        {
+            GrassBlade blade;
+            blade.position = position;
+
+            float2 clumpHash = HashFloat2(clumpCentre);
+            float2 sharedClumpFacing = normalize(tan((clumpHash + float2(0.13, 1.111)) * 2 - 1));  //整个草丛的朝向
+            float2 bladeFacing = normalize(HashFloat2(id.xy) * 2 - 1);   //单个草的朝向——基于草位置算出来的随机值
+            bladeFacing = normalize(lerp(bladeFacing, sharedClumpFacing, bladeParameters.pointInSameDirection));  //用弯曲统一程度插值
+            float combinedFacingAngle = atan2(bladeFacing.y, bladeFacing.x);  //由朝向向量计算朝向角
+
+
+            //在旋转赋值给blade之前计算风力
+            //wind
+            float2 worldUV = blade.position.xz; //草叶位置作为采样风场的uv
+            float2 localWindUV = worldUV * _LocalWindScale;  //原始风场uv
+
+            localWindUV += _Time * float2(1, 0.7) * _LocalWindSpeed; //_Time是当前时间，当下的采样风场的uv
+
+            //采样风场，局部的风只需要一个float就能表示
+            float localWind = _LocalWindTex.SampleLevel(LinearRepeatSampler, localWindUV, 0).r;
+            
+            //上面这个采样到的值是0~1之间，下面将其转化到-1~1之间
+            float localTheta = ((localWind * 2) - 1) * 3.14159;  //平面上的方向弧度
+            float2 localWindDir = float2(cos(localTheta), sin(localTheta));
+            float2 grassSideVec = normalize(float2(-bladeFacing.y, bladeFacing.x));
+            float rotateBladeFromLocalWindAmount = dot(grassSideVec, localWindDir);  //从侧面吹过来影响较小
+            float localWindRotateAngle = rotateBladeFromLocalWindAmount * (3.14159 / 2) * _LocalWindRotateAmount;
+            combinedFacingAngle += localWindRotateAngle;  //被风影响过的旋转角度
+
+            blade.rotAngle = combinedFacingAngle;
+            blade.hash = Rand(id.xyx);
+            blade.height = bladeParameters.baseHeight + Remap(Rand(id.xxy)) * bladeParameters.heightRandom;
+            blade.width = bladeParameters.baseWidth + Remap(Rand(id.yxx)) * bladeParameters.widthRandom;
+            blade.tilt = bladeParameters.baseTilt + Remap(Rand(id.xyx * float3(1.12, 3.3, 17.6))) * bladeParameters.tiltRandom;
+            blade.bend = bladeParameters.baseBend + Remap(Rand(id.xyy * float3(12.32, 0.23, 3.39))) * bladeParameters.bendRandom;
+
+            blade.bend += localWind * _LocalWindStrength;
+
+            blade.surfaceNorm = norm;
+
+            float viewAlignment = abs(dot(bladeFacing, normalize(posToCam.xz)));
+            float sideBend = lerp(0.3, 0.0, viewAlignment);  //边缘弯曲程度，正向看着草的时候不弯曲；侧着看要弯曲一下
+
+            blade.sideBend = sideBend;
+            blade.windForce = localWind * _LocalWindStrength;
+
+            _grassPosBuf.Append(blade);
+        }
+    }
+    
+}
