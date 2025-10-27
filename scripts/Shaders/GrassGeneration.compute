@@ -50,6 +50,7 @@ SamplerState samplerClumpTex;
 
 
 float3 _TerrainPosition;
+float3 _TilePosition;
 float _HeightMapScale;
 float _HeightMapMultiplier;
 
@@ -149,11 +150,13 @@ void CSMain (uint3 id : SV_DispatchThreadID)
         float2 hash = HashFloat2(id.xy);
         float2 jitter = ((hash * 2) - 1) * _JitterStrength;
         position.xz += jitter;
+        position.xz += (_TilePosition.xz - _TerrainPosition.xz);
 
         float2 clumpUV = position.xz * float2(_ClumpScale.xx); //得到采样voronoi贴图的坐标
         float3 clumpData = ClumpTex.SampleLevel(samplerClumpTex, clumpUV, 0).xyz;
         //这个数据是三个通道：r是草丛种类序号，对应一种配置，gb是草丛中心坐标
         uint clumpParameterIndex = clumpData.x;
+        clumpParameterIndex = clamp(clumpParameterIndex, 0, _NumClumpParameters - 1);
         ClumpParameter bladeParameters = _ClumpParameters[int(clumpParameterIndex)];
 
         //todo：下面三行没太看懂，感觉不太要紧，反正就是做了一些数学变换得到了草丛中心的坐标
