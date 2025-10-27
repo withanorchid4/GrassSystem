@@ -16,6 +16,12 @@ Shader "Grass/BezierGrass"
         _BottomColor ("Bottom Color", Color) = (.25, .5, .5, 1)
         _GrassAlbedo("Grass albedo", 2D) = "white" {}
         _GrassGloss("Grass gloss", 2D) = "white" {}
+
+        [Header(Wind Animation)]
+        _WaveAmplitude("Wave Amplitude", Float) = 1  //P2  P3两个控制点的额外摆动幅度
+        _WaveSpeed("Wave Speed", Float) = 1  //额外的摆动速度
+        _SinOffsetRange("Phase Variation", Range(0, 10)) = 0.3  //相位差，P2 P3摆动不一致
+        _PushTipForward("Push Tip Forward", Range(0, 2)) = 0  //P3的移动属性
     }
     SubShader
     {
@@ -77,6 +83,12 @@ Shader "Grass/BezierGrass"
             float4 _TopColor;
             float4 _BottomColor;
 
+            //wind sine
+            float _WaveAmplitude;
+            float _WaveSpeed;
+            float _SinOffsetRange;
+            float _PushTipForward;
+
             TEXTURE2D(_GrassAlbedo);
             SAMPLER(sampler_GrassAlbedo);
             TEXTURE2D(_GrassGloss);
@@ -117,16 +129,26 @@ Shader "Grass/BezierGrass"
                 return float3(-p3x, p3y, 0);
             }
 
-            void GetP1P2(float3 p0, float3 p3, float bend, out float3 p1, out float3 p2) //先均匀lerp出p1p2，然后让其向着垂直于P0P3向左上的方向偏移
+            //风效 sine  输出：P1 P2 P3
+            void GetP1P2P3(float3 p0, inout float3 p3, float bend, float hash, float windForce, out float3 p1, out float3 p2)
             {
                 p1 = lerp(p0, p3, 0.33);
                 p2 = lerp(p0, p3, 0.66);
 
                 float3 bladeDir = normalize(p3 - p0);
-                float3 bezCtrlOffsetDir = normalize(cross(bladeDir, float3(0,0,1)));  //p0p3都在z=0的xy平面内（unity左手系）
+                float3 bezCtrlOffsetDir = normalize(cross(bladeDir, float3(0,0,1)));
 
                 p1 += bezCtrlOffsetDir * bend * _p1Offset;
                 p2 += bezCtrlOffsetDir * bend * _p2Offset;
+
+                float p2WindEffect = sin((_Time.y + hash * 2 * PI) * _WaveSpeed + 0.66 * 2 * PI * _SinOffsetRange) * windForce;
+                p2WindEffect *= 0.66 * _WaveAmplitude;
+
+                float p3WindEffect = sin((_Time.y + hash * 2 * PI) * _WaveSpeed + 1.0 * 2 * PI * _SinOffsetRange) * windForce + _PushTipForward * (1 - bend);
+                p3WindEffect *= _WaveAmplitude;
+
+                p2 += bezCtrlOffsetDir * p2WindEffect;
+                p3 += bezCtrlOffsetDir * p3WindEffect;
             }
 
             float3x3 RotAxis3x3(float angle, float3 axis) //根据旋转轴和旋转角求旋转矩阵
@@ -180,12 +202,15 @@ Shader "Grass/BezierGrass"
                 float height = blade.height;
                 float tilt = blade.tilt;
 
+                float hash = blade.hash;
+                float windForce = blade.windForce;
+
                 //生成四个控制点
                 float3 p0 = GetP0();
                 float3 p3 = GetP3(height, tilt);
                 float3 p1 = float3(0,0,0);
                 float3 p2 = float3(0,0,0);
-                GetP1P2(p0, p3, bend, p1, p2);
+                GetP1P2P3(p0, p3, bend, hash, windForce, p1, p2);
 
                 //从compute buffer中获取顶点
                 int positionIndex = trianglesBuffer[v.vertexID];
